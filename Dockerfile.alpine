@@ -1,21 +1,43 @@
 # syntax=docker/dockerfile:1
-FROM docker.io/nginxproxy/docker-gen:0.17.2 AS docker-gen
 
-FROM docker.io/nginxproxy/forego:0.18.8 AS forego
+# Build docker-gen from source with a current Go toolchain so the binary
+# does not ship outdated stdlib / dependency CVEs.
+FROM docker.io/library/golang:1.27-alpine AS docker-gen-build
+ARG DOCKER_GEN_VERSION=0.17.2
+ENV CGO_ENABLED=0
+WORKDIR /build
+RUN apk add --no-cache git \
+    && git clone --depth 1 --branch "${DOCKER_GEN_VERSION}" https://github.com/nginx-proxy/docker-gen.git . \
+    && go version \
+    && go get -u github.com/klauspost/compress github.com/moby/go-archive github.com/moby/sys/user golang.org/x/crypto/... 2>&1 | tail -3 \
+    && go mod tidy \
+    && go build -ldflags "-X main.buildVersion=${DOCKER_GEN_VERSION}" -o docker-gen ./cmd/docker-gen
+
+# Build forego from source with a current Go toolchain for the same reason.
+FROM docker.io/library/golang:1.27-alpine AS forego-build
+ARG FOREGO_VERSION=v0.18.8
+ENV CGO_ENABLED=0
+WORKDIR /build
+RUN apk add --no-cache git \
+    && git clone --depth 1 --branch "${FOREGO_VERSION}" https://github.com/nginx-proxy/forego.git . \
+    && go version \
+    && go get -u golang.org/x/text/... 2>&1 | tail -3 \
+    && go mod tidy \
+    && go build -o forego .
 
 # Build the final image
-FROM docker.io/library/nginx:1.31.6-alpine
+FROM docker.io/library/nginx:1.31.9-alpine
 
 ARG NGINX_PROXY_VERSION
-# Add DOCKER_GEN_VERSION environment variable because 
+# Add DOCKER_GEN_VERSION environment variable because
 # acme-companion rely on it (but the actual value is not important)
 ARG DOCKER_GEN_VERSION="unknown"
 ENV NGINX_PROXY_VERSION=${NGINX_PROXY_VERSION} \
    DOCKER_GEN_VERSION=${DOCKER_GEN_VERSION} \
    DOCKER_HOST=unix:///tmp/docker.sock
 
-# Install dependencies
-RUN apk add --no-cache --virtual .run-deps bash openssl
+# Install dependencies (zlib upgraded for CVE-2026-4738)
+RUN apk add --no-cache --upgrade --virtual .run-deps bash openssl zlib
 
 # Configure Nginx
 RUN echo -e "\ninclude /etc/nginx/toplevel.conf.d/*.conf;" >> /etc/nginx/nginx.conf \
@@ -27,8 +49,8 @@ RUN echo -e "\ninclude /etc/nginx/toplevel.conf.d/*.conf;" >> /etc/nginx/nginx.c
    && mkdir -p '/usr/share/nginx/html/errors'
 
 # Install Forego + docker-gen
-COPY --from=forego /usr/local/bin/forego /usr/local/bin/forego
-COPY --from=docker-gen /usr/local/bin/docker-gen /usr/local/bin/docker-gen
+COPY --from=forego-build /build/forego /usr/local/bin/forego
+COPY --from=docker-gen-build /build/docker-gen /usr/local/bin/docker-gen
 
 COPY network_internal.conf /etc/nginx/
 
